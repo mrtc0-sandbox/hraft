@@ -4,14 +4,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+)
+
+const (
+	defaultResponseTimeout = 10 * time.Second
 )
 
 type fsm Store
@@ -26,12 +30,27 @@ type command struct {
 	Value string `json:"value"`
 }
 
-func NewStore(dir, address string) *Store {
-	return &Store{
+func NewStore(dir, address string, logger hclog.Logger) *Store {
+	store := &Store{
 		RaftDir:     dir,
 		BindAddress: address,
-		store:       make(map[string]string),
+		Logger:      logger,
+
+		store:           make(map[string]string),
+		ResponseTimeout: defaultResponseTimeout,
+
+		observerCh:    make(chan raft.Observation),
+		observerDone:  make(chan struct{}),
+		observerClose: make(chan struct{}),
 	}
+
+	store.observer = raft.NewObserver(store.observerCh, false, func(o *raft.Observation) bool {
+		_, isLeaderChange := o.Data.(raft.LeaderObservation)
+		_, isFailedHeartBeat := o.Data.(raft.FailedHeartbeatObservation)
+		return isLeaderChange || isFailedHeartBeat
+	})
+
+	return store
 }
 
 func (s *Store) Start(id string, bootstrap bool) error {
@@ -88,11 +107,39 @@ func (s *Store) Start(id string, bootstrap bool) error {
 		s.raft.BootstrapCluster(config)
 	}
 
+	s.RaftID = string(config.LocalID)
+	s.logStore = logStore
+	s.stableStore = stableStore
+
+	s.raft.RegisterObserver(s.observer)
+	s.observerClose, s.observerDone = s.observe()
+
+	return nil
+}
+
+func (s *Store) Stop() error {
+	s.Logger.Info("stopping store server", "id", s.RaftID)
+
+	close(s.observerClose)
+	<-s.observerDone
+
+	if err := s.raft.Shutdown().Error(); err != nil {
+		return err
+	}
+
+	if err := s.logStore.Close(); err != nil {
+		return err
+	}
+
+	if err := s.stableStore.Close(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func (s *Store) Join(nodeID, nodeAddress string) error {
-	slog.Info("received join request", "id", nodeID, "address", nodeAddress)
+	s.Logger.Info("received join request", "id", nodeID, "address", nodeAddress)
 
 	configFuture := s.raft.GetConfiguration()
 	if err := configFuture.Error(); err != nil {
@@ -104,7 +151,7 @@ func (s *Store) Join(nodeID, nodeAddress string) error {
 		if server.ID == raft.ServerID(nodeID) || server.Address == raft.ServerAddress(nodeAddress) {
 			// If the node with the same ID and address exists, do nothing.
 			if server.ID == raft.ServerID(nodeID) && server.Address == raft.ServerAddress(nodeAddress) {
-				slog.Info("Node already joined", "id", nodeID, "address", nodeAddress)
+				s.Logger.Info("Node already joined", "id", nodeID, "address", nodeAddress)
 				return nil
 			}
 
@@ -121,14 +168,46 @@ func (s *Store) Join(nodeID, nodeAddress string) error {
 		return fmt.Errorf("failed to add voter %s: %s", nodeID, err)
 	}
 
-	slog.Info("Node joined successfully", "id", nodeID, "address", nodeAddress)
+	s.Logger.Info("Node joined successfully", "id", nodeID, "address", nodeAddress)
 	return nil
+}
+
+func (s *Store) observe() (closeCh, doneCh chan struct{}) {
+	closeCh = make(chan struct{})
+	doneCh = make(chan struct{})
+
+	go func() {
+		defer close(doneCh)
+
+		for {
+			select {
+			case o := <-s.observerCh:
+				switch sig := o.Data.(type) {
+				case raft.LeaderObservation:
+					s.Logger.Info(fmt.Sprintf("leadership changed, new leader is %s(ID: %s)", sig.Leader, sig.LeaderID))
+				case raft.FailedHeartbeatObservation:
+					dur := time.Since(sig.LastContact)
+					if dur > s.ResponseTimeout {
+						s.Logger.Warn("heartbeet failed, remove node from cluster", "id", sig.PeerID, "last_contact", sig.LastContact)
+						f := s.raft.RemoveServer(sig.PeerID, 0, 0)
+						if f.Error() != nil {
+							s.Logger.Error(fmt.Sprintf("failed to remove node %s", sig.PeerID), "error", f.Error())
+						}
+					}
+				}
+			case <-closeCh:
+				return
+			}
+		}
+	}()
+
+	return closeCh, doneCh
 }
 
 func (f *fsm) Apply(l *raft.Log) interface{} {
 	var c command
 	if err := json.Unmarshal(l.Data, &c); err != nil {
-		slog.Error("Failed to unmarshal command", "error", err)
+		f.Logger.Error("Failed to unmarshal command", "error", err)
 	}
 
 	switch c.Op {
@@ -137,9 +216,8 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	case "delete":
 		return f.applyDelete(c.Key)
 	default:
-		slog.Error("Unrecognized command op", "op", c.Op)
+		f.Logger.Error("Unrecognized command op", "op", c.Op)
 	}
-	fmt.Println("ddddddddddd")
 	return nil
 }
 
@@ -158,7 +236,7 @@ func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
 func (f *fsm) Restore(rc io.ReadCloser) error {
 	store := make(map[string]string)
 	if err := json.NewDecoder(rc).Decode(&store); err != nil {
-		slog.Error("Failed to decode snapshot", "error", err)
+		f.Logger.Error("Failed to decode snapshot", "error", err)
 	}
 
 	f.store = store

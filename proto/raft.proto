@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+option go_package = "github.com/mrtc0-sandbox/hraft/proto";
+
+service RaferService {
+    rpc Join(RaftClusterJoinRequest) returns (RaftClusterJoinResponse) {}
+}
+
+message RaftClusterJoinRequest {
+    string address = 1;
+}
+
+message RaftClusterJoinResponse {
+    bool success = 1;
+}

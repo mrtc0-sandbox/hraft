@@ -6,7 +6,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 )
 
 const (
@@ -17,11 +19,27 @@ const (
 type Store struct {
 	mu sync.Mutex
 
+	RaftID      string
 	RaftDir     string
 	BindAddress string
+	Logger      hclog.Logger
 
 	store map[string]string
 	raft  *raft.Raft
+
+	logStore    *raftboltdb.BoltStore
+	stableStore *raftboltdb.BoltStore
+
+	// ResponseTimeout is the duration after which a non-reachable node is removed
+	ResponseTimeout time.Duration
+
+	observer   *raft.Observer
+	observerCh chan raft.Observation
+	// Channel to notify that the observer has terminated
+	observerDone chan struct{}
+	// Channel for notifying the observer to terminate
+	// To terminate the observer, close this channel.
+	observerClose chan struct{}
 }
 
 func (s *Store) Get(key string) (string, error) {
