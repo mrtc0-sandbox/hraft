@@ -65,6 +65,12 @@ func main() {
 	<-terminate
 	logger.Info("Received termination signal. Shutting down...")
 
+	if s.IsLeader() {
+		if err := s.LeadershipTransfer(); err != nil {
+			logger.Error("failed to transfer leadership", "error", err)
+		}
+	}
+
 	if err := s.Stop(); err != nil {
 		logger.Error("failed to stop store", "error", err)
 		os.Exit(1)

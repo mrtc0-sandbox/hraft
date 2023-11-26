@@ -94,7 +94,13 @@ func (s *Store) Start(id string, bootstrap bool) error {
 
 	s.raft = r
 
-	if bootstrap {
+	nodes, err := s.Nodes()
+	if err != nil {
+		return err
+	}
+	hasPeers := len(nodes) > 0
+
+	if bootstrap || !hasPeers {
 		config := raft.Configuration{
 			Servers: []raft.Server{
 				{
@@ -106,6 +112,7 @@ func (s *Store) Start(id string, bootstrap bool) error {
 
 		s.raft.BootstrapCluster(config)
 	}
+	// TODO: auto discovery for join
 
 	s.RaftID = string(config.LocalID)
 	s.logStore = logStore
@@ -170,6 +177,24 @@ func (s *Store) Join(nodeID, nodeAddress string) error {
 
 	s.Logger.Info("Node joined successfully", "id", nodeID, "address", nodeAddress)
 	return nil
+}
+
+func (s *Store) Nodes() ([]raft.Server, error) {
+	configFuture := s.raft.GetConfiguration()
+	if err := configFuture.Error(); err != nil {
+		return nil, err
+	}
+
+	return configFuture.Configuration().Servers, nil
+}
+
+func (s *Store) IsLeader() bool {
+	return s.raft.State() == raft.Leader
+}
+
+func (s *Store) LeadershipTransfer() error {
+	f := s.raft.LeadershipTransfer()
+	return f.Error()
 }
 
 func (s *Store) observe() (closeCh, doneCh chan struct{}) {
