@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/mrtc0-sandbox/hraft/api"
@@ -19,7 +21,7 @@ import (
 var (
 	httpAddr        = flag.String("haddr", ":8080", "Listen address")
 	raftAddr        = flag.String("raddr", ":12000", "Raft address")
-	joinAddr        = flag.String("join", "", "Join address")
+	joinAddrs       = flag.String("join", "", "Join address")
 	nodeID          = flag.String("id", "", "Node ID")
 	bootstrap       = flag.Bool("bootstrap", false, "Bootstrap the cluster")
 	dataDir         = flag.String("data", "", "Data directory")
@@ -53,8 +55,8 @@ func main() {
 		}
 	}()
 
-	if *joinAddr != "" {
-		if err := join(*joinAddr, *raftAddr, *nodeID); err != nil {
+	if *joinAddrs != "" {
+		if err := join(*joinAddrs, *raftAddr, *nodeID); err != nil {
 			logger.Error("failed to join cluster", "error", err)
 			os.Exit(1)
 		}
@@ -79,21 +81,28 @@ func main() {
 	logger.Info("Shutdown completed")
 }
 
-func join(joinAddr, raftAddr, nodeID string) error {
-	b, err := json.Marshal(map[string]string{
-		"addr": raftAddr,
-		"id":   nodeID,
-	})
+func join(joinAddrs, raftAddr, nodeID string) error {
+	// TODO: Implement retry logic
 
-	if err != nil {
-		return err
+	for {
+		for _, joinAddr := range strings.Split(joinAddrs, ",") {
+			b, err := json.Marshal(map[string]string{
+				"addr": raftAddr,
+				"id":   nodeID,
+			})
+
+			if err != nil {
+				return err
+			}
+
+			resp, err := http.Post(fmt.Sprintf("http://%s/internal/cluster/join", joinAddr), "application/json", bytes.NewReader(b))
+			if err != nil || resp.StatusCode != http.StatusOK {
+				continue
+			}
+
+			return nil
+		}
+
+		time.Sleep(1 * time.Second)
 	}
-
-	resp, err := http.Post(fmt.Sprintf("http://%s/internal/cluster/join", joinAddr), "application/json", bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-
-	defer resp.Body.Close()
-	return nil
 }

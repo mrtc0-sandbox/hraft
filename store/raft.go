@@ -112,7 +112,6 @@ func (s *Store) Start(id string, bootstrap bool) error {
 
 		s.raft.BootstrapCluster(config)
 	}
-	// TODO: auto discovery for join
 
 	s.RaftID = string(config.LocalID)
 	s.logStore = logStore
